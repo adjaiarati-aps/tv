@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Player de avisos</title>
+<style>
+  :root { --fundo:#000; --painel:#14171c; --texto:#eef1f5; --suave:#9aa3b2; --destaque:#4da3ff; --erro:#ff7a7a; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--fundo); color:var(--texto); font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow:hidden; cursor:none; }
+  video, img#img { position:fixed; inset:0; width:100%; height:100%; object-fit:contain; background:#000; }
+  [hidden] { display:none !important; }
+
+  #aguarde { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:.6rem; text-align:center; padding:2rem; }
+  #aguarde h1 { font-size:2.2rem; font-weight:600; margin:0; }
+  #aguarde p { color:var(--suave); font-size:1.2rem; margin:0; max-width:36ch; }
+
+  #aviso { position:fixed; left:1rem; bottom:1rem; max-width:80vw; background:rgba(20,23,28,.92); color:var(--texto); padding:.6rem .9rem; border-radius:8px; font-size:1rem; opacity:0; transition:opacity .25s; pointer-events:none; }
+  #aviso.on { opacity:1; }
+  #aviso.erro { color:var(--erro); }
+
+  #config { position:fixed; inset:0; background:var(--fundo); display:flex; align-items:center; justify-content:center; padding:1.5rem; overflow:auto; cursor:auto; }
+  #config form { width:min(560px,100%); background:var(--painel); border-radius:14px; padding:1.75rem; display:grid; gap:1rem; }
+  #config h2 { margin:0; font-size:1.5rem; }
+  #config label { display:grid; gap:.35rem; font-size:.95rem; color:var(--suave); }
+  #config input { font:inherit; font-size:1.05rem; padding:.7rem .8rem; border-radius:8px; border:1px solid #2b303a; background:#0c0e12; color:var(--texto); }
+  #config input:focus-visible, #config button:focus-visible { outline:3px solid var(--destaque); outline-offset:2px; }
+  #config button { font:inherit; font-size:1.05rem; font-weight:600; padding:.8rem 1rem; border-radius:8px; border:0; background:var(--destaque); color:#00162e; cursor:pointer; }
+  #config small { color:var(--suave); line-height:1.4; }
+</style>
+</head>
+<body>
+
+<video id="vid" playsinline hidden></video>
+<img id="img" alt="" hidden>
+
+<div id="aguarde" hidden>
+  <h1 id="aguardeTitulo">Aguardando vídeos</h1>
+  <p id="aguardeTexto">Coloque os vídeos na pasta do Google Drive desta TV.</p>
+</div>
+
+<div id="aviso" role="status"></div>
+
+<div id="config" hidden>
+  <form id="form">
+    <h2>Configurar esta TV</h2>
+    <label>Nome da TV
+      <input id="fNome" placeholder="Ex.: Recepção" autocomplete="off">
+    </label>
+    <label>Link da pasta no Google Drive
+      <input id="fPasta" placeholder="https://drive.google.com/drive/folders/..." autocomplete="off" required>
+    </label>
+    <label>Chave de acesso (API key)
+      <input id="fChave" placeholder="AIza..." autocomplete="off" required>
+    </label>
+    <button type="submit">Salvar e começar</button>
+    <small>A pasta precisa estar compartilhada como "Qualquer pessoa com o link". Depois de salvo, os vídeos são baixados para esta TV e tocam mesmo sem internet.</small>
+  </form>
+</div>
+
+<script>
+'use strict';
+
+const MEDIA = 'tv-media-v1';
+const $ = (id) => document.getElementById(id);
+const vid = $('vid'), img = $('img'), aviso = $('aviso'), aguarde = $('aguarde'), telaConfig = $('config');
+
+const load = (k, d) => { try { const v = JSON.parse(localStorage.getItem(k)); return v ?? d; } catch { return d; } };
+const save = (k, v) => localStorage.setItem(k, JSON.stringify(v));
+const keyFor = (id) => 'https://midia.local/' + id;
+
+// ---------- Configuração ----------
+const P = new URLSearchParams(location.search);
+
+function parseFolder(txt) {
+  txt = (txt || '').trim();
+  const m = txt.match(/folders\/([A-Za-z0-9_-]+)/) || txt.match(/[?&]id=([A-Za-z0-9_-]+)/);
+  if (m) return m[1];
+  return /^[A-Za-z0-9_-]{15,}$/.test(txt) ? txt : '';
+}
+
+let cfg = load('tv.cfg', {});
+if (P.get('pasta') || P.get('chave') || P.get('nome')) {
+  cfg = {
+    ...cfg,
+    folder: parseFolder(P.get('pasta')) || cfg.folder,
+    key: P.get('chave') || cfg.key,
+    nome: P.get('nome') || cfg.nome
+  };
+  save('tv.cfg', cfg);
+}
+const MIN = Number(P.get('min')) || 5;          // de quantos em quantos minutos confere a pasta
+const IMG_SEG = Number(P.get('img')) || 10;     // segundos por imagem
+const MUDO = P.get('mudo') === '1';
+const DEBUG = P.get('debug') === '1';
+
+// ---------- Avisos na tela (escondidos por padrão) ----------
+let avisoTimer;
+function dizer(texto, { erro = false, fixo = false } = {}) {
+  aviso.textContent = texto;
+  aviso.classList.toggle('erro', erro);
+  aviso.classList.add('on');
+  clearTimeout(avisoTimer);
+  if (!fixo && !DEBUG) avisoTimer = setTimeout(() => aviso.classList.remove('on'), 7000);
+}
+let ultimoStatus = 'Tocando.';
+function mostrarStatus() { dizer((cfg.nome ? cfg.nome + ' · ' : '') + ultimoStatus); }
+
+// ---------- Google Drive ----------
+async function listarPasta() {
+  const q = `'${cfg.folder}' in parents and trashed=false`;
+  const url = 'https://www.googleapis.com/drive/v3/files?q=' + encodeURIComponent(q) +
+    '&fields=' + encodeURIComponent('files(id,name,mimeType,modifiedTime,md5Checksum)') +
+    '&orderBy=name&pageSize=200&key=' + encodeURIComponent(cfg.key);
+  const r = await fetch(url);
+  if (!r.ok) {
+    const e = new Error('Drive ' + r.status);
+    e.status = r.status;
+    throw e;
+  }
+  const j = await r.json();
+  return (j.files || []).filter((f) => /^(video|image)\//.test(f.mimeType));
+}
+
+async function baixar(f) {
+  const url = `https://www.googleapis.com/drive/v3/files/${f.id}?alt=media&key=${encodeURIComponent(cfg.key)}`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error('Download ' + r.status);
+  const c = await caches.open(MEDIA);
+  await c.put(keyFor(f.id), r);   // só substitui o arquivo antigo quando o novo terminou de baixar
+}
+
+// ---------- Sincronização ----------
+let sincronizando = false;
+async function sincronizar() {
+  if (sincronizando) return;
+  sincronizando = true;
+  let mudou = false;
+  try {
+    const arquivos = await listarPasta();
+    const meta = load('tv.meta', {});
+    const cache = await caches.open(MEDIA);
+
+    // baixa o que é novo ou foi trocado
+    const pendentes = arquivos.filter((f) => meta[f.id]?.v !== (f.md5Checksum || f.modifiedTime));
+    let n = 0;
+    for (const f of pendentes) {
+      n++;
+      ultimoStatus = `Baixando ${n} de ${pendentes.length}: ${f.name}`;
+      if (DEBUG) dizer(ultimoStatus, { fixo: true });
+      try {
+        await baixar(f);
+        meta[f.id] = { name: f.name, mime: f.mimeType, v: f.md5Checksum || f.modifiedTime };
+        save('tv.meta', meta);
+        mudou = true;
+      } catch (e) {
+        console.warn('Falha ao baixar', f.name, e);
+      }
+    }
+
+    // apaga o que saiu da pasta
+    const ids = new Set(arquivos.map((f) => f.id));
+    for (const id of Object.keys(meta)) {
+      if (!ids.has(id)) {
+        await cache.delete(keyFor(id));
+        delete meta[id];
+        mudou = true;
+      }
+    }
+    save('tv.meta', meta);
+
+    // monta a lista de reprodução (só o que já está salvo no aparelho)
+    const lista = arquivos
+      .filter((f) => meta[f.id])
+      .map((f) => ({ id: f.id, name: f.name, mime: meta[f.id].mime }));
+    const antiga = load('tv.list', []);
+    if (JSON.stringify(antiga) !== JSON.stringify(lista)) { save('tv.list', lista); mudou = true; }
+
+    ultimoStatus = `Atualizado às ${new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}. ${lista.length} item(ns).`;
+    if (DEBUG) dizer(ultimoStatus, { fixo: true });
+  } catch (e) {
+    if (e.status === 403 || e.status === 400) {
+      ultimoStatus = 'Chave de acesso inválida ou Drive API desligada.';
+      dizer(ultimoStatus, { erro: true });
+    } else if (e.status === 404) {
+      ultimoStatus = 'Pasta não encontrada. Confira o link e o compartilhamento.';
+      dizer(ultimoStatus, { erro: true });
+    } else {
+      ultimoStatus = 'Sem internet. Tocando o que está salvo.';
+      if (DEBUG) dizer(ultimoStatus, { fixo: true, erro: true });
+    }
+  } finally {
+    sincronizando = false;
+  }
+  if (mudou) aoMudarLista();
+}
+
+// ---------- Reprodução ----------
+let atual = null, timer = null, blobUrl = null;
+
+function aoMudarLista() {
+  const lista = load('tv.list', []);
+  vid.loop = lista.length === 1;
+  // vídeo único em loop nunca "termina", então força a leitura da lista nova
+  if (!aguarde.hidden || vid.loop || (atual && !lista.some((x) => x.id === atual.id))) tocarProximo();
+}
+
+function mostrarAguarde(titulo, texto) {
+  vid.hidden = true; img.hidden = true; aguarde.hidden = false;
+  $('aguardeTitulo').textContent = titulo;
+  $('aguardeTexto').textContent = texto;
+}
+
+async function tocarProximo() {
+  clearTimeout(timer);
+  const lista = load('tv.list', []);
+  if (!lista.length) {
+    mostrarAguarde(cfg.nome || 'Aguardando vídeos', 'Coloque os vídeos na pasta do Google Drive desta TV. Eles aparecem aqui sozinhos.');
+    timer = setTimeout(tocarProximo, 5000);
+    return;
+  }
+  const i = atual ? lista.findIndex((x) => x.id === atual.id) : -1;
+  const item = lista[(i + 1) % lista.length];
+  atual = item;
+
+  let blob;
+  try {
+    const c = await caches.open(MEDIA);
+    const r = await c.match(keyFor(item.id));
+    blob = r ? await r.blob() : null;
+  } catch { blob = null; }
+  if (!blob) { timer = setTimeout(tocarProximo, 1500); return; }
+
+  const antigo = blobUrl;
+  blobUrl = URL.createObjectURL(blob);
+  aguarde.hidden = true;
+
+  if (item.mime.startsWith('image/')) {
+    vid.pause(); vid.hidden = true;
+    img.src = blobUrl; img.hidden = false;
+    timer = setTimeout(tocarProximo, IMG_SEG * 1000);
+  } else {
+    img.hidden = true; vid.hidden = false;
+    vid.loop = lista.length === 1;
+    vid.muted = MUDO;
+    vid.src = blobUrl;
+    try { await vid.play(); }
+    catch { vid.muted = true; vid.play().catch(() => {}); }   // se o navegador bloquear o som, toca mudo
+  }
+  if (antigo) URL.revokeObjectURL(antigo);
+}
+
+vid.addEventListener('ended', tocarProximo);
+vid.addEventListener('error', () => { timer = setTimeout(tocarProximo, 2000); });
+
+// ---------- Tela de configuração ----------
+function abrirConfig() {
+  $('fNome').value = cfg.nome || '';
+  $('fPasta').value = cfg.folder ? 'https://drive.google.com/drive/folders/' + cfg.folder : '';
+  $('fChave').value = cfg.key || '';
+  telaConfig.hidden = false;
+  document.body.style.cursor = 'auto';
+  $('fNome').focus();
+}
+$('form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const folder = parseFolder($('fPasta').value);
+  if (!folder) { $('fPasta').setCustomValidity('Link da pasta inválido'); $('fPasta').reportValidity(); return; }
+  $('fPasta').setCustomValidity('');
+  save('tv.cfg', { ...cfg, nome: $('fNome').value.trim(), folder, key: $('fChave').value.trim() });
+  location.href = location.pathname;
+});
+
+// Toque/OK uma vez mostra o status; 5 vezes seguidas abre a configuração.
+let toques = [];
+function toque() {
+  const t = Date.now();
+  toques = toques.filter((x) => t - x < 4000).concat(t);
+  if (toques.length >= 5) { toques = []; abrirConfig(); } else { mostrarStatus(); }
+}
+document.addEventListener('click', (e) => { if (telaConfig.hidden) toque(); });
+document.addEventListener('keydown', (e) => {
+  if (!telaConfig.hidden) return;
+  if (e.key === 'Enter' || e.key === ' ') toque();
+});
+
+// ---------- Início ----------
+async function manterTelaLigada() {
+  try { if ('wakeLock' in navigator) await navigator.wakeLock.request('screen'); } catch {}
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) manterTelaLigada(); });
+
+async function iniciar() {
+  if (!cfg.folder || !cfg.key || P.has('config')) { abrirConfig(); return; }
+
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+  if (navigator.storage?.persist) navigator.storage.persist().catch(() => {});
+  manterTelaLigada();
+  if (DEBUG) dizer('Iniciando…', { fixo: true });
+
+  tocarProximo();          // começa já com o que está salvo, sem esperar a internet
+  sincronizar();
+  setInterval(sincronizar, MIN * 60 * 1000);
+  window.addEventListener('online', sincronizar);
+  // enquanto ainda não tem nada para tocar, tenta de novo a cada 30 s
+  setInterval(() => { if (!load('tv.list', []).length) sincronizar(); }, 30000);
+}
+iniciar();
+</script>
+</body>
+</html>
